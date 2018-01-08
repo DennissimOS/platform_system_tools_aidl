@@ -21,10 +21,13 @@
 #include <string.h>
 
 #include <android-base/macros.h>
+#include <android-base/stringprintf.h>
 
 #include "type_java.h"
 
 using std::string;
+
+using android::base::StringPrintf;
 
 namespace android {
 namespace aidl {
@@ -42,10 +45,18 @@ class StubClass : public Class {
   Variable* transact_reply;
   Variable* transact_flags;
   SwitchStatement* transact_switch;
+  StatementBlock* transact_statements;
+
+  // Finish generation. This will add a default case to the switch.
+  void finish();
+
+  Expression* get_transact_descriptor(const JavaTypeNamespace* types);
 
  private:
   void make_as_interface(const InterfaceType* interfaceType,
                          JavaTypeNamespace* types);
+
+  Variable* transact_descriptor;
 
   DISALLOW_COPY_AND_ASSIGN(StubClass);
 };
@@ -53,6 +64,8 @@ class StubClass : public Class {
 StubClass::StubClass(const Type* type, const InterfaceType* interfaceType,
                      JavaTypeNamespace* types)
     : Class() {
+  transact_descriptor = nullptr;
+
   this->comment = "/** Local-side IPC implementation stub class. */";
   this->modifiers = PUBLIC | ABSTRACT | STATIC;
   this->what = Class::CLASS;
@@ -107,15 +120,34 @@ StubClass::StubClass(const Type* type, const InterfaceType* interfaceType,
   onTransact->parameters.push_back(this->transact_reply);
   onTransact->parameters.push_back(this->transact_flags);
   onTransact->statements = new StatementBlock;
+  transact_statements = onTransact->statements;
   onTransact->exceptions.push_back(types->RemoteExceptionType());
   this->elements.push_back(onTransact);
   this->transact_switch = new SwitchStatement(this->transact_code);
+}
 
-  onTransact->statements->Add(this->transact_switch);
+void StubClass::finish() {
+  Case* default_case = new Case;
+
   MethodCall* superCall = new MethodCall(
-      SUPER_VALUE, "onTransact", 4, this->transact_code, this->transact_data,
-      this->transact_reply, this->transact_flags);
-  onTransact->statements->Add(new ReturnStatement(superCall));
+        SUPER_VALUE, "onTransact", 4, this->transact_code, this->transact_data,
+        this->transact_reply, this->transact_flags);
+  default_case->statements->Add(new ReturnStatement(superCall));
+  transact_switch->cases.push_back(default_case);
+
+  transact_statements->Add(this->transact_switch);
+}
+
+Expression* StubClass::get_transact_descriptor(const JavaTypeNamespace* types) {
+  // Store the descriptor literal into a local variable, in an effort to save
+  // const-string instructions in each switch case.
+  if (transact_descriptor == nullptr) {
+    transact_descriptor = new Variable(types->StringType(), "descriptor");
+    transact_statements->Add(
+        new VariableDeclaration(transact_descriptor,
+                                new LiteralExpression("DESCRIPTOR")));
+  }
+  return transact_descriptor;
 }
 
 void StubClass::make_as_interface(const InterfaceType* interfaceType,
@@ -257,28 +289,9 @@ static void generate_string_constant(const AidlStringConstant& constant,
   interface->elements.push_back(decl);
 }
 
-static void generate_method(const AidlMethod& method, Class* interface,
-                            StubClass* stubClass, ProxyClass* proxyClass,
-                            int index, JavaTypeNamespace* types) {
-  int i;
-
-  const bool oneway = proxyClass->mOneWay || method.IsOneway();
-
-  // == the TRANSACT_ constant =============================================
-  string transactCodeName = "TRANSACTION_";
-  transactCodeName += method.GetName();
-
-  char transactCodeValue[60];
-  sprintf(transactCodeValue, "(android.os.IBinder.FIRST_CALL_TRANSACTION + %d)",
-          index);
-
-  Field* transactCode = new Field(
-      STATIC | FINAL, new Variable(types->IntType(), transactCodeName));
-  transactCode->value = transactCodeValue;
-  stubClass->elements.push_back(transactCode);
-
-  // == the declaration in the interface ===================================
-  Method* decl = new Method;
+static std::unique_ptr<Method> generate_interface_method(
+    const AidlMethod& method, JavaTypeNamespace* types) {
+  std::unique_ptr<Method> decl(new Method);
   decl->comment = method.GetComments();
   decl->modifiers = PUBLIC;
   decl->returnType = method.GetType().GetLanguageType<Type>();
@@ -293,93 +306,135 @@ static void generate_method(const AidlMethod& method, Class* interface,
 
   decl->exceptions.push_back(types->RemoteExceptionType());
 
-  interface->elements.push_back(decl);
+  return decl;
+}
 
-  // == the stub method ====================================================
-
-  Case* c = new Case(transactCodeName);
-
+static void generate_stub_code(const AidlMethod& method,
+                               const std::string& transactCodeName,
+                               bool oneway,
+                               Variable* transact_data,
+                               Variable* transact_reply,
+                               JavaTypeNamespace* types,
+                               StatementBlock* statements,
+                               StubClass* stubClass) {
   MethodCall* realCall = new MethodCall(THIS_VALUE, method.GetName());
 
   // interface token validation is the very first thing we do
-  c->statements->Add(new MethodCall(stubClass->transact_data,
-                                    "enforceInterface", 1,
-                                    new LiteralExpression("DESCRIPTOR")));
+  statements->Add(new MethodCall(transact_data,
+                                 "enforceInterface", 1,
+                                 stubClass->get_transact_descriptor(types)));
 
   // args
-  Variable* cl = NULL;
   VariableFactory stubArgs("_arg");
-  for (const std::unique_ptr<AidlArgument>& arg : method.GetArguments()) {
-    const Type* t = arg->GetType().GetLanguageType<Type>();
-    Variable* v = stubArgs.Get(t);
-    v->dimension = arg->GetType().IsArray() ? 1 : 0;
+  {
+    Variable* cl = NULL;
+    for (const std::unique_ptr<AidlArgument>& arg : method.GetArguments()) {
+      const Type* t = arg->GetType().GetLanguageType<Type>();
+      Variable* v = stubArgs.Get(t);
+      v->dimension = arg->GetType().IsArray() ? 1 : 0;
 
-    c->statements->Add(new VariableDeclaration(v));
+      statements->Add(new VariableDeclaration(v));
 
-    if (arg->GetDirection() & AidlArgument::IN_DIR) {
-      generate_create_from_parcel(t, c->statements, v, stubClass->transact_data,
-                                  &cl);
-    } else {
-      if (!arg->GetType().IsArray()) {
-        c->statements->Add(new Assignment(v, new NewExpression(v->type)));
+      if (arg->GetDirection() & AidlArgument::IN_DIR) {
+        generate_create_from_parcel(t,
+                                    statements,
+                                    v,
+                                    transact_data,
+                                    &cl);
       } else {
-        generate_new_array(v->type, c->statements, v, stubClass->transact_data,
-                           types);
+        if (!arg->GetType().IsArray()) {
+          statements->Add(new Assignment(v, new NewExpression(v->type)));
+        } else {
+          generate_new_array(v->type,
+                             statements,
+                             v,
+                             transact_data,
+                             types);
+        }
       }
-    }
 
-    realCall->arguments.push_back(v);
+      realCall->arguments.push_back(v);
+    }
   }
 
-  cl = NULL;
-
   // the real call
-  Variable* _result = NULL;
   if (method.GetType().GetName() == "void") {
-    c->statements->Add(realCall);
+    statements->Add(realCall);
 
     if (!oneway) {
       // report that there were no exceptions
       MethodCall* ex =
-          new MethodCall(stubClass->transact_reply, "writeNoException", 0);
-      c->statements->Add(ex);
+          new MethodCall(transact_reply, "writeNoException", 0);
+      statements->Add(ex);
     }
   } else {
-    _result =
-        new Variable(decl->returnType, "_result", decl->returnTypeDimension);
-    c->statements->Add(new VariableDeclaration(_result, realCall));
+    Variable* _result =
+        new Variable(method.GetType().GetLanguageType<Type>(),
+                     "_result",
+                     method.GetType().IsArray() ? 1 : 0);
+    statements->Add(new VariableDeclaration(_result, realCall));
 
     if (!oneway) {
       // report that there were no exceptions
       MethodCall* ex =
-          new MethodCall(stubClass->transact_reply, "writeNoException", 0);
-      c->statements->Add(ex);
+          new MethodCall(transact_reply, "writeNoException", 0);
+      statements->Add(ex);
     }
 
     // marshall the return value
-    generate_write_to_parcel(decl->returnType, c->statements, _result,
-                             stubClass->transact_reply,
+    generate_write_to_parcel(method.GetType().GetLanguageType<Type>(),
+                             statements,
+                             _result,
+                             transact_reply,
                              Type::PARCELABLE_WRITE_RETURN_VALUE);
   }
 
   // out parameters
-  i = 0;
+  int i = 0;
   for (const std::unique_ptr<AidlArgument>& arg : method.GetArguments()) {
     const Type* t = arg->GetType().GetLanguageType<Type>();
     Variable* v = stubArgs.Get(i++);
 
     if (arg->GetDirection() & AidlArgument::OUT_DIR) {
-      generate_write_to_parcel(t, c->statements, v, stubClass->transact_reply,
+      generate_write_to_parcel(t,
+                               statements,
+                               v,
+                               transact_reply,
                                Type::PARCELABLE_WRITE_RETURN_VALUE);
     }
   }
 
   // return true
-  c->statements->Add(new ReturnStatement(TRUE_VALUE));
-  stubClass->transact_switch->cases.push_back(c);
+  statements->Add(new ReturnStatement(TRUE_VALUE));
+}
 
-  // == the proxy method ===================================================
-  Method* proxy = new Method;
+
+static void generate_stub_case(const AidlMethod& method,
+                               const std::string& transactCodeName,
+                               bool oneway,
+                               StubClass* stubClass,
+                               JavaTypeNamespace* types) {
+  Case* c = new Case(transactCodeName);
+
+  generate_stub_code(method,
+                     transactCodeName,
+                     oneway,
+                     stubClass->transact_data,
+                     stubClass->transact_reply,
+                     types,
+                     c->statements,
+                     stubClass);
+
+  stubClass->transact_switch->cases.push_back(c);
+}
+
+static std::unique_ptr<Method> generate_proxy_method(
+    const AidlMethod& method,
+    const std::string& transactCodeName,
+    bool oneway,
+    ProxyClass* proxyClass,
+    JavaTypeNamespace* types) {
+  std::unique_ptr<Method> proxy(new Method);
   proxy->comment = method.GetComments();
   proxy->modifiers = PUBLIC | OVERRIDE;
   proxy->returnType = method.GetType().GetLanguageType<Type>();
@@ -392,7 +447,6 @@ static void generate_method(const AidlMethod& method, Class* interface,
                      arg->GetType().IsArray() ? 1 : 0));
   }
   proxy->exceptions.push_back(types->RemoteExceptionType());
-  proxyClass->elements.push_back(proxy);
 
   // the parcels
   Variable* _data = new Variable(types->ParcelType(), "_data");
@@ -406,7 +460,7 @@ static void generate_method(const AidlMethod& method, Class* interface,
   }
 
   // the return value
-  _result = NULL;
+  Variable* _result = NULL;
   if (method.GetType().GetName() != "void") {
     _result = new Variable(proxy->returnType, "_result",
                            method.GetType().IsArray() ? 1 : 0);
@@ -451,7 +505,7 @@ static void generate_method(const AidlMethod& method, Class* interface,
       proxyClass->mRemote, "transact", 4,
       new LiteralExpression("Stub." + transactCodeName), _data,
       _reply ? _reply : NULL_VALUE,
-      new LiteralExpression(oneway ? "android.os.IBinder.FLAG_ONEWAY" : "0"));
+          new LiteralExpression(oneway ? "android.os.IBinder.FLAG_ONEWAY" : "0"));
   tryStatement->statements->Add(call);
 
   // throw back exceptions.
@@ -462,6 +516,7 @@ static void generate_method(const AidlMethod& method, Class* interface,
 
   // returning and cleanup
   if (_reply != NULL) {
+    Variable* cl = nullptr;
     if (_result != NULL) {
       generate_create_from_parcel(proxy->returnType, tryStatement->statements,
                                   _result, _reply, &cl);
@@ -484,6 +539,42 @@ static void generate_method(const AidlMethod& method, Class* interface,
   if (_result != NULL) {
     proxy->statements->Add(new ReturnStatement(_result));
   }
+
+  return proxy;
+}
+
+static void generate_methods(const AidlMethod& method,
+                             Class* interface,
+                             StubClass* stubClass,
+                             ProxyClass* proxyClass,
+                             int index,
+                             JavaTypeNamespace* types) {
+  const bool oneway = proxyClass->mOneWay || method.IsOneway();
+
+  // == the TRANSACT_ constant =============================================
+  string transactCodeName = "TRANSACTION_";
+  transactCodeName += method.GetName();
+
+  Field* transactCode = new Field(
+      STATIC | FINAL, new Variable(types->IntType(), transactCodeName));
+  transactCode->value =
+      StringPrintf("(android.os.IBinder.FIRST_CALL_TRANSACTION + %d)", index);
+  stubClass->elements.push_back(transactCode);
+
+  // == the declaration in the interface ===================================
+  Method* decl = generate_interface_method(method, types).release();
+  interface->elements.push_back(decl);
+
+  // == the stub method ====================================================
+  generate_stub_case(method, transactCodeName, oneway, stubClass, types);
+
+  // == the proxy method ===================================================
+  Method* proxy = generate_proxy_method(method,
+                                        transactCodeName,
+                                        oneway,
+                                        proxyClass,
+                                        types).release();
+  proxyClass->elements.push_back(proxy);
 }
 
 static void generate_interface_descriptors(StubClass* stub, ProxyClass* proxy,
@@ -491,7 +582,7 @@ static void generate_interface_descriptors(StubClass* stub, ProxyClass* proxy,
   // the interface descriptor transaction handler
   Case* c = new Case("INTERFACE_TRANSACTION");
   c->statements->Add(new MethodCall(stub->transact_reply, "writeString", 1,
-                                    new LiteralExpression("DESCRIPTOR")));
+                                    stub->get_transact_descriptor(types)));
   c->statements->Add(new ReturnStatement(TRUE_VALUE));
   stub->transact_switch->cases.push_back(c);
 
@@ -542,8 +633,9 @@ Class* generate_binder_interface_class(const AidlInterface* iface,
 
   // all the declared methods of the interface
   for (const auto& item : iface->GetMethods()) {
-    generate_method(*item, interface, stub, proxy, item->GetId(), types);
+    generate_methods(*item, interface, stub, proxy, item->GetId(), types);
   }
+  stub->finish();
 
   return interface;
 }
